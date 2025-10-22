@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List
 
 from pydantic import BaseModel
 
@@ -16,6 +16,7 @@ class PlayerResponse(BaseModel):
     player_name: str
     player_email: str
     player_mobile: str = None
+    profile_photo_url: Optional[str] = None
     active_game_code: Optional[str] = None
 
 
@@ -34,6 +35,7 @@ class QuestionRequest(BaseModel):
     question: str
     answer: str
     genre: str
+    question_options: Optional[List[str]] = []
 
 
 class QuestionsAddedResponseModel(BaseModel):
@@ -58,6 +60,7 @@ class GameStatusResponse(BaseModel):
     session_code: str
     is_active: bool
     is_waiting_for_players: bool
+    isstarted: bool
     current_question_index: int
     total_questions: int
     current_question: dict

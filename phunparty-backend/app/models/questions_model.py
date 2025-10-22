@@ -1,5 +1,4 @@
-from sqlalchemy import Column, Enum, String
-
+from sqlalchemy import JSON, Column, String, Enum as SAEnum
 from app.config import Base
 from app.models.enums import DifficultyLevel
 
@@ -10,4 +9,9 @@ class Questions(Base):
     question = Column(String, nullable=False)
     answer = Column(String, nullable=False)
     genre = Column(String, nullable=False)
-    difficulty = Column(Enum(DifficultyLevel), default="easy", nullable=False)
+    difficulty = Column(
+        SAEnum(DifficultyLevel, name="difficulty_levels"),
+        default=DifficultyLevel.easy,
+        nullable=False,
+    )
+    question_options = Column(JSON, nullable=False)

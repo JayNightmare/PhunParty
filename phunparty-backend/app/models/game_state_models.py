@@ -36,5 +36,7 @@ class GameSessionState(Base):
     is_active = Column(Boolean, default=True)
     is_waiting_for_players = Column(Boolean, default=True)
     total_questions = Column(Integer, nullable=False)
+    ispublic = Column(Boolean, default=True)
+    isstarted = Column(Boolean, default=False)
     started_at = Column(DateTime, default=datetime.utcnow)
     ended_at = Column(DateTime, nullable=True)

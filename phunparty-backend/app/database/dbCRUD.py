@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
-from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.orm import Session, aliased
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models.game_model import Game
@@ -36,7 +37,12 @@ def create_game(db: Session, rules: str, genre: str) -> Game:
 
 
 def create_game_session(
-    db: Session, host_name: str, number_of_questions: int, game_code: str
+    db: Session,
+    host_name: str,
+    number_of_questions: int,
+    game_code: str,
+    owner_player_id: str = None,
+    ispublic: bool = True,
 ) -> GameSession:
     """Create a new game session with the specified parameters."""
     session_code = generate_session_code()
@@ -45,6 +51,7 @@ def create_game_session(
         host_name=host_name,
         number_of_questions=number_of_questions,
         game_code=game_code,
+        owner_player_id=owner_player_id,
     )
     db.add(gameSession)
     db.commit()
@@ -55,7 +62,7 @@ def create_game_session(
 
     # Initialize game state tracking
     try:
-        create_game_session_state(db, session_code)
+        create_game_session_state(db, session_code, ispublic)
     except Exception as e:
         print(f"Warning: Could not initialize game state: {e}")
 
@@ -63,7 +70,20 @@ def create_game_session(
 
 
 def get_session_by_code(db: Session, session_code: str) -> GameSession:
-    """Retrieve a game session by its session code."""
+    """Retrieve an active game session by its session code."""
+    return (
+        db.query(GameSession)
+        .join(
+            GameSessionState, GameSession.session_code == GameSessionState.session_code
+        )
+        .filter(GameSession.session_code == session_code)
+        .filter(GameSessionState.is_active == True)
+        .first()
+    )
+
+
+def _get_session_by_code_internal(db: Session, session_code: str) -> GameSession:
+    """Internal function to retrieve any game session by its session code (active or inactive)."""
     return (
         db.query(GameSession).filter(GameSession.session_code == session_code).first()
     )
@@ -84,9 +104,31 @@ def join_game(db: Session, session_code: str, player_id: str) -> GameSession:
     gameSession = get_session_by_code(db, session_code)
     if not gameSession:
         raise ValueError("Game session not found")
+
     player = get_player_by_ID(db, player_id)
+    if not player:
+        raise ValueError("Player not found")
+
+    # Check if player has an active game code
     if player.active_game_code is not None:
-        raise ValueError("Player is already in a game session")
+        # Check if the active game code points to an actual active session
+        active_session = get_session_by_code(db, player.active_game_code)
+
+        if active_session:
+            # Player is in a real active session
+            if active_session.session_code == session_code:
+                # Player is trying to join the same session they're already in
+                return gameSession
+            else:
+                # Player is in a different active session
+                raise ValueError(
+                    f"Player is already in a game session: {player.active_game_code}"
+                )
+        else:
+            # Player's active_game_code points to an inactive session, clear it
+            player.active_game_code = None
+            db.commit()
+
     update_player_game_code(db, player_id, gameSession.session_code)
     assign_player_to_session(db, player_id, session_code)
     create_score(db, session_code, player_id)
@@ -130,12 +172,14 @@ def end_game_session(db: Session, session_code: str) -> dict:
         final_results = calculate_game_results(db, session_code)
         return {
             "action": "game_ended",
-            "game_status": "completed",
+            "game_state": "completed",
             "final_results": [
                 {
                     "player_id": result.player_id,
                     "score": result.score,
                     "result": result.result,
+                    "player_name": get_player_by_ID(db, result.player_id).player_name,
+                    "session_code": session_code,
                 }
                 for result in final_results
             ],
@@ -143,7 +187,7 @@ def end_game_session(db: Session, session_code: str) -> dict:
     except Exception as e:
         return {
             "action": "game_ended",
-            "game_status": "completed",
+            "game_state": "completed",
             "error": f"Could not calculate final results: {str(e)}",
         }
 
@@ -194,6 +238,8 @@ def create_player(
 def update_player_game_code(db: Session, player_id: str, game_code: str) -> Players:
     """Update the game code of a player."""
     player = get_player_by_ID(db, player_id)
+    if not player:
+        raise ValueError(f"Player {player_id} not found")
     player.active_game_code = game_code
     db.commit()
     db.refresh(player)
@@ -216,9 +262,26 @@ def update_player(db: Session, player_id: str, player: Player) -> Players:
         new_player.player_name = player.player_name
         new_player.player_email = player.player_email
         new_player.player_mobile = player.player_mobile
+        if (
+            hasattr(player, "profile_photo_url")
+            and player.profile_photo_url is not None
+        ):
+            new_player.profile_photo_url = player.profile_photo_url
         db.commit()
         db.refresh(new_player)
     return new_player
+
+
+def update_player_photo(db: Session, player_id: str, photo_url: str = None) -> Players:
+    """Update a player's profile photo URL."""
+    player = get_player_by_ID(db, player_id)
+    if not player:
+        raise ValueError("Player not found")
+
+    player.profile_photo_url = photo_url
+    db.commit()
+    db.refresh(player)
+    return player
 
 
 def get_number_of_players_in_session(db: Session, session_code: str) -> int:
@@ -231,6 +294,16 @@ def get_number_of_players_in_session(db: Session, session_code: str) -> int:
         .filter(SessionAssignment.session_code == session_code)
         .count()
     )
+
+
+def get_game_history_for_player(db: Session, player_id: str) -> list:
+    """
+    Get the game history for a specific player.
+    """
+    history = (
+        db.query(GameSession).filter(GameSession.owner_player_id == player_id).all()
+    )
+    return history
 
     # Session Player Assignment CRUD operations -----------------------------------------------------------------------------------------------------
 
@@ -252,9 +325,10 @@ def assign_player_to_session(db: Session, player_id: str, session_code: str) -> 
     # Session Questions Assignment CRUD operations --------------------------------------------------------------------------------------------------------------
 
 
+# Rebooting
 def add_question_to_session(db: Session, session_code: str) -> None:
     """Add a question to a game session."""
-    session = get_session_by_code(db, session_code)
+    session = _get_session_by_code_internal(db, session_code)
     if not session:
         raise ValueError("Session not found")
     game = get_game_by_code(db, session.game_code)
@@ -384,16 +458,22 @@ def calculate_game_results(db: Session, session_code: str):
         else:
             s.result = "lose"
     db.commit()
-    db.refresh(session_scores)
+
+    # Refresh each score object individually
+    for score in session_scores:
+        db.refresh(score)
+
     return session_scores
 
 
 # Game State Management CRUD operations -----------------------------------------------------------------------------------------------------------------
 
 
-def create_game_session_state(db: Session, session_code: str) -> GameSessionState:
+def create_game_session_state(
+    db: Session, session_code: str, ispublic: bool
+) -> GameSessionState:
     """Initialize the game state when a session is created"""
-    session = get_session_by_code(db, session_code)
+    session = _get_session_by_code_internal(db, session_code)
     if not session:
         raise ValueError("Session not found")
 
@@ -409,6 +489,8 @@ def create_game_session_state(db: Session, session_code: str) -> GameSessionStat
         current_question_index=0,
         current_question_id=first_question.question_id if first_question else None,
         is_active=True,
+        ispublic=ispublic,
+        isstarted=False,
         is_waiting_for_players=True,
         total_questions=session.number_of_questions,
     )
@@ -420,12 +502,271 @@ def create_game_session_state(db: Session, session_code: str) -> GameSessionStat
 
 
 def get_game_session_state(db: Session, session_code: str) -> GameSessionState:
-    """Get current game state for a session"""
+    """Get current game state for an active session"""
     return (
         db.query(GameSessionState)
         .filter(GameSessionState.session_code == session_code)
+        .filter(GameSessionState.is_active == True)
         .first()
     )
+
+
+def get_session_details(db: Session, session_code: str) -> dict:
+    """
+    Get comprehensive session information including session code, genre,
+    number of questions, active status, and privacy status.
+    """
+    # Get the session
+    session = get_session_by_code(db, session_code)
+    if not session:
+        return None
+
+    # Get the game to get the genre
+    game = get_game_by_code(db, session.game_code)
+    if not game:
+        return None
+
+    # Get the game state for active/inactive and public/private status
+    game_state = get_game_session_state(db, session_code)
+
+    # Default values if game state doesn't exist
+    is_active = True
+    is_public = True
+    started_at = None
+    ended_at = None
+
+    if game_state:
+        is_active = game_state.is_active
+        is_public = game_state.is_public
+        started_at = game_state.started_at
+        ended_at = game_state.ended_at
+
+    return {
+        "session_code": session.session_code,
+        "host_name": session.host_name,
+        "game_code": session.game_code,
+        "genre": game.genre,
+        "number_of_questions": session.number_of_questions,
+        "is_active": is_active,
+        "is_public": is_public,
+        "created_at": started_at,
+        "ended_at": ended_at,
+    }
+
+
+# TODO: Remove duplication with get_all_public_sessions
+
+
+def get_all_public_sessions(db: Session) -> list:
+    """
+    Get all public active sessions (available to everyone).
+    Returns basic session info: session_code, genre, number_of_questions, difficulty
+    """
+    # Subquery to get difficulty for each session (optimized)
+    difficulty_subquery = (
+        db.query(
+            SessionQuestionAssignment.session_code,
+            func.min(Questions.difficulty).label("difficulty"),
+        )
+        .join(Questions, SessionQuestionAssignment.question_id == Questions.question_id)
+        .group_by(SessionQuestionAssignment.session_code)
+        .subquery()
+    )
+
+    sessions = (
+        db.query(GameSession, Game, GameSessionState, difficulty_subquery.c.difficulty)
+        .join(Game, GameSession.game_code == Game.game_code)
+        .join(
+            GameSessionState, GameSession.session_code == GameSessionState.session_code
+        )
+        .outerjoin(
+            difficulty_subquery,
+            GameSession.session_code == difficulty_subquery.c.session_code,
+        )
+        .filter(GameSessionState.ispublic == True)
+        .filter(GameSessionState.is_active == True)
+        .all()
+    )
+
+    result = []
+    for session, game, state, difficulty in sessions:
+        result.append(
+            {
+                "session_code": session.session_code,
+                "genre": game.genre,
+                "number_of_questions": session.number_of_questions,
+                "difficulty": difficulty.value if difficulty else "Unknown",
+            }
+        )
+
+    return result
+
+
+def get_player_private_sessions(db: Session, player_id: str) -> list:
+    """
+    Get all private active sessions owned by a specific player.
+    Returns basic session info: session_code, genre, number_of_questions, difficulty
+    """
+    # Subquery to get difficulty for each session (optimized)
+    difficulty_subquery = (
+        db.query(
+            SessionQuestionAssignment.session_code,
+            func.min(Questions.difficulty).label("difficulty"),
+        )
+        .join(Questions, SessionQuestionAssignment.question_id == Questions.question_id)
+        .group_by(SessionQuestionAssignment.session_code)
+        .subquery()
+    )
+
+    sessions = (
+        db.query(GameSession, Game, GameSessionState, difficulty_subquery.c.difficulty)
+        .join(Game, GameSession.game_code == Game.game_code)
+        .join(
+            GameSessionState, GameSession.session_code == GameSessionState.session_code
+        )
+        .outerjoin(
+            difficulty_subquery,
+            GameSession.session_code == difficulty_subquery.c.session_code,
+        )
+        .filter(GameSession.owner_player_id == player_id)
+        .filter(GameSessionState.ispublic == False)
+        .filter(GameSessionState.is_active == True)
+        .all()
+    )
+
+    result = []
+    for session, game, state, difficulty in sessions:
+        result.append(
+            {
+                "session_code": session.session_code,
+                "genre": game.genre,
+                "number_of_questions": session.number_of_questions,
+                "difficulty": difficulty.value if difficulty else "Unknown",
+                "ispublic": state.ispublic,
+            }
+        )
+
+    return result
+
+
+def get_all_sessions_from_player(db: Session, player_id: str) -> list:
+    """
+    Get all sessions owned by a specific player.
+    Returns basic session info: session_code, genre, number_of_questions, difficulty
+    """
+    # Subquery to get difficulty for each session (optimized)
+    difficulty_subquery = (
+        db.query(
+            SessionQuestionAssignment.session_code,
+            func.min(Questions.difficulty).label("difficulty"),
+        )
+        .join(Questions, SessionQuestionAssignment.question_id == Questions.question_id)
+        .group_by(SessionQuestionAssignment.session_code)
+        .subquery()
+    )
+
+    sessions = (
+        db.query(GameSession, Game, GameSessionState, difficulty_subquery.c.difficulty)
+        .join(Game, GameSession.game_code == Game.game_code)
+        .join(
+            GameSessionState, GameSession.session_code == GameSessionState.session_code
+        )
+        .outerjoin(
+            difficulty_subquery,
+            GameSession.session_code == difficulty_subquery.c.session_code,
+        )
+        .filter(GameSession.owner_player_id == player_id)
+        .filter(GameSessionState.is_active == True)
+        .all()
+    )
+
+    result = []
+    for session, game, state, difficulty in sessions:
+        result.append(
+            {
+                "session_code": session.session_code,
+                "genre": game.genre,
+                "number_of_questions": session.number_of_questions,
+                "difficulty": difficulty.value if difficulty else "Unknown",
+                "ispublic": state.ispublic,
+            }
+        )
+
+    return result
+
+
+def get_game_history_for_player(db: Session, player_id: str) -> list:
+    """
+    Get the games played by a specific player using the session assignments table and joining scores table to display if they won, lost, or drew along with their scores.
+    """
+    history = (
+        db.query(
+            GameSession.session_code,
+            Game.genre,
+            Scores.score,
+            Scores.result,
+            GameSessionState.ended_at,
+        )
+        .join(
+            SessionAssignment,
+            GameSession.session_code == SessionAssignment.session_code,
+        )
+        .join(
+            Scores,
+            (Scores.session_code == GameSession.session_code)
+            & (Scores.player_id == player_id),
+        )
+        .join(
+            GameSessionState, GameSession.session_code == GameSessionState.session_code
+        )
+        .filter(SessionAssignment.player_id == player_id)
+        .filter(GameSessionState.is_active == False)  # Only completed games
+        .all()
+    )
+    return [
+        {
+            "session_code": record.session_code,
+            "genre": record.genre,
+            "score": record.score,
+            "result": record.result,
+            "ended_at": record.ended_at,
+        }
+        for record in history
+    ]
+
+
+def get_session_difficulty(db: Session, session_code: str) -> str:
+    """Get the difficulty level from questions assigned to a session"""
+    try:
+        # Get the first question assigned to this session to determine difficulty
+        difficulty = (
+            db.query(Questions.difficulty)
+            .join(
+                SessionQuestionAssignment,
+                Questions.question_id == SessionQuestionAssignment.question_id,
+            )
+            .filter(SessionQuestionAssignment.session_code == session_code)
+            .first()
+        )
+
+        if difficulty:
+            return difficulty[0].value  # Extract the enum value
+        return "easy"  # Default fallback
+    except Exception:
+        return "easy"  # Default fallback
+
+
+def get_session_player_count(db: Session, session_code: str) -> int:
+    """Get the number of players currently in a session"""
+    try:
+        count = (
+            db.query(SessionAssignment)
+            .filter(SessionAssignment.session_code == session_code)
+            .count()
+        )
+        return count
+    except Exception:
+        return 0
 
 
 def create_player_response(
@@ -494,32 +835,35 @@ def get_session_questions_ordered(
 
 def advance_to_next_question(db: Session, session_code: str) -> dict:
     """Advance game to next question or end if no more questions"""
-    game_state = get_game_session_state(db, session_code)
-    if not game_state:
-        raise ValueError("Game state not found")
+    try:
+        game_state = get_game_session_state(db, session_code)
+        if not game_state:
+            raise ValueError("Game state not found")
 
-    questions_in_session = get_session_questions_ordered(db, session_code)
-    next_question_index = game_state.current_question_index + 1
+        questions_in_session = get_session_questions_ordered(db, session_code)
+        next_question_index = game_state.current_question_index + 1
 
-    if next_question_index < len(questions_in_session):
-        # Move to next question
-        next_question = questions_in_session[next_question_index]
-        game_state.current_question_index = next_question_index
-        game_state.current_question_id = next_question.question_id
-        game_state.is_waiting_for_players = True
+        if next_question_index < len(questions_in_session):
+            # Move to next question
+            next_question = questions_in_session[next_question_index]
+            game_state.current_question_index = next_question_index
+            game_state.current_question_id = next_question.question_id
+            game_state.is_waiting_for_players = True
 
-        db.commit()
-        db.refresh(game_state)
+            db.commit()
+            db.refresh(game_state)
 
-        return {
-            "action": "next_question",
-            "next_question_id": next_question.question_id,
-            "current_question_index": next_question_index,
-            "waiting_for_players": True,
-        }
-    else:
-        # No more questions, end the game using the comprehensive end_game_session
-        return end_game_session(db, session_code)
+            return {
+                "action": "next_question",
+                "next_question_id": next_question.question_id,
+                "current_question_index": next_question_index,
+                "waiting_for_players": True,
+            }
+        else:
+            # No more questions, end the game using the comprehensive end_game_session
+            return end_game_session(db, session_code)
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def update_game_state_waiting_status(
@@ -555,6 +899,7 @@ def get_current_question_details(db: Session, session_code: str) -> dict:
         "session_code": session_code,
         "is_active": game_state.is_active,
         "is_waiting_for_players": game_state.is_waiting_for_players,
+        "isstarted": game_state.isstarted,
         "current_question_index": game_state.current_question_index,
         "total_questions": game_state.total_questions,
         "current_question": {

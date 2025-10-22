@@ -1,4 +1,5 @@
 from fastapi import Depends, FastAPI
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from app.config import Base, engine
@@ -17,10 +18,12 @@ from app.routes import (
     game,
     game_logic,
     passwordReset,
+    photos,
     players,
     questions,
     scores,
 )
+from app.websockets import routes as websocket_routes
 
 app = FastAPI(title="PhunParty Backend API")
 
@@ -87,6 +90,30 @@ app.include_router(
 app.include_router(
     passwordReset.router, prefix="/password-reset", tags=["Password Reset"]
 )
+
+app.include_router(
+    photos.router,
+    prefix="/photos",
+    tags=[
+        {
+            "name": "Photos",
+            "description": "Endpoints for managing player profile photos",
+        }
+    ],
+)
+
+app.include_router(
+    websocket_routes.router,
+    tags=[
+        {
+            "name": "WebSockets",
+            "description": "WebSocket endpoints for real-time game functionality",
+        }
+    ],
+)
+
+# Mount static files for serving photos
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # Initialize database tables
 try:
@@ -231,6 +258,12 @@ def read_root():
                         "endpoint": "/game-logic/current-question/{session_code}",
                         "description": "Get the current question for a session",
                         "example": "GET http://localhost:8000/game-logic/current-question/SESSION123",
+                    },
+                    {
+                        "method": "PUT",
+                        "endpoint": "/game-logic/start-game/{session_code}",
+                        "description": "Update the game's started status",
+                        "example": "PUT http://localhost:8000/game-logic/start-game/{session_code",
                     },
                 ],
             },

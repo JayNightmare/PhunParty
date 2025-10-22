@@ -3,7 +3,11 @@ from sqlalchemy.orm import Session
 
 from app.database.dbCRUD import get_current_question_details
 from app.dependencies import get_api_key, get_db
-from app.logic.game_logic import get_current_question_for_session, submit_player_answer
+from app.logic.game_logic import (
+    get_current_question_for_session,
+    submit_player_answer,
+    updateGameStartStatus,
+)
 from app.models.response_models import GameStatusResponse, SubmitAnswerRequest
 
 router = APIRouter(dependencies=[Depends(get_api_key)])
@@ -24,12 +28,8 @@ def submit_answer(request: SubmitAnswerRequest, db: Session = Depends(get_db)):
             player_answer=request.player_answer,
         )
         return result
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Error submitting answer: {str(e)}"
-        )
+        raise HTTPException(status_code=400, detail="Failed to submit answer")
 
 
 @router.get(
@@ -47,8 +47,10 @@ def get_session_status(session_code: str, db: Session = Depends(get_db)):
         if "error" in status:
             raise HTTPException(status_code=404, detail=status["error"])
         return status
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting status: {str(e)}")
+        raise HTTPException(status_code=500, detail="Unable to retrieve game status")
 
 
 @router.get("/current-question/{session_code}", tags=["Game Logic"])
@@ -59,9 +61,19 @@ def get_current_question(session_code: str, db: Session = Depends(get_db)):
     try:
         result = get_current_question_for_session(db, session_code)
         return result
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(
-            status_code=500, detail=f"Error getting current question: {str(e)}"
+            status_code=500, detail="Unable to retrieve current question"
         )
+
+
+@router.put("/start-game/{session_code}", tags=["Game Logic"])
+def start_game(session_code: str, db: Session = Depends(get_db)):
+    """
+    Start the game for a given session code.
+    """
+    try:
+        updateGameStartStatus(db, session_code, True)
+        return {"message": "Game started successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to start game")

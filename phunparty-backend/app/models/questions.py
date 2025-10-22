@@ -1,6 +1,4 @@
 from pydantic import BaseModel
-from sqlalchemy import Enum
-
 from app.models.enums import DifficultyLevel
 
 
@@ -9,6 +7,7 @@ class Question(BaseModel):
     answer: str
     genre: str
     difficulty: DifficultyLevel
+    question_options: list[str]
 
 
 class AnswerVerification(BaseModel):
