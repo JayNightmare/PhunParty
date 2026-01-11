@@ -107,7 +107,6 @@ def check_and_advance_game(
             "total_questions": game_state.total_questions,
             "game_state": frontend_game_state,
             # Add frontend-compatible format
-            "gameState": frontend_game_state,
             "currentQuestion": game_state.current_question_index
             + 1,  # Frontend expects 1-based indexing
             "totalQuestions": game_state.total_questions,
@@ -158,7 +157,6 @@ def check_and_advance_game(
                 result.update(advancement_result)
 
                 # Update frontend-compatible data for game end
-                result["gameState"] = "ended"
                 result["game_state"] = "ended"
         else:
             logger.info(
@@ -351,39 +349,86 @@ async def broadcast_question_with_options(
         # Get question with randomized options
         question_data = get_question_with_randomized_options(db, question_id)
 
+        # Determine ui_mode based on difficulty
+        difficulty = question_data.get("difficulty", "").lower()
+        ui_mode = "text_input"  # Default
+        if (
+            question_data.get("display_options")
+            and len(question_data["display_options"]) > 0
+        ):
+            if difficulty in ["easy", "medium"]:
+                ui_mode = "multiple_choice"
+            elif difficulty == "hard":
+                ui_mode = "text_input"
+
         # Create message for mobile players (without correct answer info)
+        # MUST match the format from TriviaGameHandler.format_question_for_mobile()
         player_message = {
-            "type": "new_question",
+            "type": "question_started",
             "data": {
+                "game_type": "trivia",  # CRITICAL: Mobile needs this to identify game mode
                 "question_id": question_data["question_id"],
                 "question": question_data["question"],
                 "genre": question_data["genre"],
                 "difficulty": question_data["difficulty"],
                 "display_options": question_data["display_options"],
+                "options": question_data["display_options"],  # Primary field for mobile
+                "ui_mode": ui_mode,  # Mobile uses this to determine input type
                 "question_index": None,  # Will be added by caller if needed
                 "total_questions": None,  # Will be added by caller if needed
             },
         }
 
-        # Create message for web host (with correct answer info)
+        # Create message for web host (with correct answer info AND display_options)
+        # Web gets extra fields for answer tracking
         host_message = {
-            "type": "new_question",
+            "type": "question_started",
             "data": {
-                **player_message["data"],
+                "game_type": "trivia",  # Include for consistency
+                "question_id": question_data["question_id"],
+                "question": question_data["question"],
+                "genre": question_data["genre"],
+                "difficulty": question_data["difficulty"],
                 "answer": question_data["answer"],
                 "correct_index": question_data["correct_index"],
-                "question_options": question_data["question_options"],
+                "display_options": question_data[
+                    "display_options"
+                ],  # Randomized options for display
+                "options": question_data["display_options"],  # Alias for compatibility
+                "question_options": question_data[
+                    "question_options"
+                ],  # All original options
+                "ui_mode": ui_mode,  # Include ui_mode for web
+                "question_index": None,
+                "total_questions": None,
             },
         }
 
+        logger.info(
+            f"📝 Broadcasting question {question_id} - display_options: {question_data['display_options']}, correct_index: {question_data.get('correct_index')}, ui_mode: {ui_mode}"
+        )
+
+        # CRITICAL: Queue the question data so mobile clients can retrieve it
+        # This ensures questions are never lost even if WebSocket messages are missed
+        mobile_question_data = player_message["data"]
+        manager.queue_question(session_code, mobile_question_data)
+        logger.info(f"📥 Question {question_id} queued for session {session_code}")
+
         # Send to mobile players (without answer)
+        logger.info(
+            f"📱 Sending question_started to MOBILE clients - question_id: {question_data['question_id']}, ui_mode: {ui_mode}, options: {len(question_data['display_options'])} items"
+        )
+        logger.info(f"📱 MOBILE MESSAGE PAYLOAD: {player_message}")
         await manager.broadcast_to_mobile_players(session_code, player_message)
 
-        # Send to web host (with answer info)
+        # Send to web host (with answer info and display_options)
+        logger.info(
+            f"💻 Sending question_started to WEB clients - question_id: {question_data['question_id']}, ui_mode: {ui_mode}, options: {len(question_data['display_options'])} items"
+        )
         await manager.broadcast_to_web_clients(session_code, host_message)
 
         logger.info(
-            f"Broadcasted question {question_id} with options to session {session_code}"
+            f"✅ Broadcasted question {question_id} with display_options and ui_mode={ui_mode} to session {session_code}"
         )
 
     except Exception as e:
@@ -391,13 +436,16 @@ async def broadcast_question_with_options(
         # Try to send a fallback question instead of just an error
         try:
             fallback_message = {
-                "type": "new_question",
+                "type": "question_started",
                 "data": {
+                    "game_type": "trivia",  # Include game_type for mobile compatibility
                     "question_id": question_id,
                     "question": "Question temporarily unavailable",
                     "genre": "Trivia",
                     "difficulty": "easy",
                     "display_options": ["Please wait for next question"],
+                    "options": ["Please wait for next question"],
+                    "ui_mode": "text_input",
                     "question_index": None,
                     "total_questions": None,
                 },

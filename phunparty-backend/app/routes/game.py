@@ -11,6 +11,7 @@ from app.database.dbCRUD import get_all_games as gag
 from app.database.dbCRUD import (
     get_all_public_sessions,
     get_game_by_code,
+    get_game_history_for_player,
     get_player_private_sessions,
     get_session_by_code,
     get_session_details,
@@ -19,7 +20,7 @@ from app.database.dbCRUD import (
 from app.dependencies import get_api_key, get_db
 from app.models.game import GameCreation, GameJoinRequest, GameSessionCreation
 from app.models.game_model import Game
-from app.models.response_models import GameResponse
+from app.models.response_models import GameHistoryResponse, GameResponse
 from app.websockets.manager import manager
 from app.queue.join_queue_manager import join_queue_manager
 from app.queue.queue_models import (
@@ -51,7 +52,11 @@ def create_game_session_route(
     request: GameSessionCreation, db: Session = Depends(get_db)
 ):
     """
-    Create a new game session.
+    Create a new game session with randomly selected questions.
+
+    The difficulty parameter is optional:
+    - If provided ('easy', 'medium', 'hard'), only questions of that difficulty will be selected
+    - If not provided, questions of any difficulty will be randomly selected
     """
     try:
         gameSession = create_game_session(
@@ -61,6 +66,7 @@ def create_game_session_route(
             request.game_code,
             request.owner_player_id,
             request.ispublic,
+            request.difficulty,
         )
         return {
             "session_code": gameSession.session_code,
@@ -68,10 +74,36 @@ def create_game_session_route(
             "number_of_questions": gameSession.number_of_questions,
             "game_code": gameSession.game_code,
             "owner_player_id": gameSession.owner_player_id,
-            "message": "Game session created successfully",
+            "difficulty": request.difficulty,
+            "message": "Game session created successfully with randomly selected questions",
         }
+    except ValueError as e:
+        # Handle specific validation errors (like invalid difficulty or not enough questions)
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to create game session")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create game session: {str(e)}"
+        )
+
+
+@router.get(
+    "/history/{player_id}", response_model=List[GameHistoryResponse], tags=["Game"]
+)
+def get_player_game_history(player_id: str, db: Session = Depends(get_db)):
+    """
+    Get the game history for a specific player.
+    Returns a list of completed games with session_code, game_type (genre), and did_win (boolean).
+    """
+    try:
+        history = get_game_history_for_player(db, player_id)
+        return history
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail=f"Unable to retrieve game history: {str(e)}"
+        )
 
 
 @router.get("/{game_code}", tags=["Game"])
@@ -314,21 +346,6 @@ async def end_game_route(session_code: str, db: Session = Depends(get_db)):
                 "data": result,
             },
         )
-
-        # Optional: Give clients time to process the message before cleaning up connections
-        # Uncomment the following lines if you want to close WebSocket connections after game ends
-        # import asyncio
-        # await asyncio.sleep(2)  # Wait 2 seconds for clients to process
-        #
-        # # Get all connections for this session and disconnect them
-        # connections = manager.get_session_connections(session_code)
-        # for ws_id, connection_info in connections.items():
-        #     websocket = connection_info["websocket"]
-        #     try:
-        #         await websocket.close(code=1000, reason="Game ended")
-        #     except:
-        #         pass  # Connection might already be closed
-        #     manager.disconnect(websocket)
 
         return result
     except Exception as e:

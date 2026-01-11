@@ -2,6 +2,8 @@
 WebSocket routes for real-time game functionality
 """
 
+import asyncio
+from datetime import datetime
 import json
 import logging
 from typing import Optional
@@ -78,6 +80,44 @@ async def websocket_endpoint(
             player_name = player_name or player.player_name
             player_photo = player_photo or player.profile_photo_url
 
+            # CRITICAL: Check for existing connections from this player
+            # Prevent duplicate registrations that cause the 7x join bug
+            existing_connections = manager.get_player_connections(
+                session_code, player_id
+            )
+
+            if existing_connections:
+                logger.warning(
+                    f"⚠️ Player {player_id} ({player_name}) already has {len(existing_connections)} connection(s) to session {session_code}"
+                )
+                logger.info(
+                    f"🔌 Closing {len(existing_connections)} old connection(s) before establishing new one"
+                )
+
+                # Close all old connections from this player
+                for old_ws_id, old_conn_info in existing_connections.items():
+                    try:
+                        old_ws = old_conn_info.get("websocket")
+                        if old_ws:
+                            await old_ws.close(
+                                code=1000, reason="New connection established"
+                            )
+                            logger.info(
+                                f"✅ Closed old connection {old_ws_id} for player {player_id}"
+                            )
+                    except Exception as e:
+                        logger.error(f"Error closing old connection: {e}")
+
+                # Clean up the connection records
+                manager.disconnect_player_by_id(session_code, player_id)
+
+                # Small delay to ensure cleanup completes
+                await asyncio.sleep(0.2)
+
+                logger.info(
+                    f"✅ Cleanup complete - ready for new connection from {player_name}"
+                )
+
         # Connect to session
         await manager.connect(
             websocket=websocket,
@@ -86,6 +126,13 @@ async def websocket_endpoint(
             player_id=player_id,
             player_name=player_name,
             player_photo=player_photo,
+        )
+
+        # Log connection stats for monitoring
+        total_connections = manager.get_total_connection_count()
+        session_connections = len(manager.active_connections.get(session_code, {}))
+        logger.info(
+            f"📊 Connection stats - Session: {session_connections}, Total: {total_connections}"
         )
 
         # Send initial session state to the connecting client
@@ -177,16 +224,41 @@ async def send_initial_session_state(
             },
         }
 
-        # Add current question if game is active
-        if game_state and game_state.get("is_active"):
+        # Add current question ONLY for web clients AND only if game has started
+        # Mobile clients should NOT receive question in initial state - they get it via game_started flow
+        if (
+            client_type == "web"
+            and game_state
+            and game_state.get("is_active")
+            and game_state.get("isstarted")
+        ):
             try:
                 current_question = get_current_question_details(db, session_code)
                 if current_question:
                     initial_state["data"]["current_question"] = current_question
+                    logger.info(
+                        f"Included current question in initial state for web client"
+                    )
             except Exception as e:
                 logger.warning(f"Could not get current question: {e}")
+        elif client_type == "mobile":
+            # For mobile, explicitly indicate they should wait for game_started
+            logger.info(
+                f"Mobile client connecting - will receive question after game_started event"
+            )
 
         await manager.send_personal_message(initial_state, websocket)
+
+        # For web clients, send an immediate follow-up roster update after initial state
+        # This ensures the web UI has the most current roster in case players joined
+        # while the web client was connecting
+        if client_type == "web":
+            # Small delay to ensure initial_state is processed first
+            await asyncio.sleep(0.05)
+            await manager.broadcast_player_roster_update(session_code)
+            logger.info(
+                f"📋 Sent follow-up roster update to newly connected web client"
+            )
 
     except Exception as e:
         logger.error(f"Error sending initial session state: {e}")
@@ -210,8 +282,74 @@ async def handle_websocket_message(
     )
 
     if message_type == "ping":
-        # Heartbeat/keepalive
-        await manager.send_personal_message({"type": "pong"}, websocket)
+        # Heartbeat/keepalive with clock synchronization
+        manager.update_heartbeat(websocket)
+
+        # Include server time for client clock offset calculation
+        server_time_ms = int(datetime.utcnow().timestamp() * 1000)
+        client_sent_at = data.get("clientSentAt") if data else None
+
+        pong_data = {
+            "type": "pong",
+            "serverTime": server_time_ms,  # Server UTC time in milliseconds
+        }
+
+        # Echo back client timestamp if provided for RTT calculation
+        if client_sent_at:
+            pong_data["clientSentAt"] = client_sent_at
+
+        await manager.send_personal_message(pong_data, websocket)
+
+    elif message_type == "pong":
+        # Client responding to server ping - update heartbeat
+        manager.update_heartbeat(websocket)
+        # No response needed for pong
+
+    elif message_type == "connection_ack":
+        # Client acknowledging successful connection - mark as ready
+        manager.mark_client_ready(websocket)
+        manager.update_heartbeat(websocket)
+        logger.info(f"Client acknowledged connection for session {session_code}")
+
+    elif message_type == "request_current_question" and client_type == "mobile":
+        # Mobile client requesting current question from queue
+        logger.info(
+            f"📲 Mobile client requesting current question for session {session_code}"
+        )
+        current_question = manager.get_current_question(session_code)
+
+        if current_question:
+            logger.info(
+                f"📤 Sending queued question {current_question.get('question_id')} to mobile client"
+            )
+            await manager.send_personal_message(
+                {
+                    "type": "question_started",
+                    "data": current_question,
+                },
+                websocket,
+            )
+        else:
+            logger.warning(f"⚠️ No queued question available for session {session_code}")
+            # Fallback: try to get from database
+            try:
+                from app.database.dbCRUD import get_current_question_details
+
+                game_status = get_current_question_details(db, session_code)
+                if game_status and game_status.get("current_question"):
+                    question_data = game_status["current_question"]
+                    logger.info(
+                        f"📤 Sending DB question {question_data.get('question_id')} to mobile client"
+                    )
+                    await manager.send_personal_message(
+                        {
+                            "type": "question_started",
+                            "data": question_data,
+                        },
+                        websocket,
+                    )
+            except Exception as e:
+                logger.error(f"Failed to get question from DB: {e}")
 
     elif message_type == "submit_answer" and client_type == "mobile":
         # Player submitting an answer
@@ -220,6 +358,32 @@ async def handle_websocket_message(
 
         if answer and question_id and player_id:
             await game_handler.handle_player_answer(player_id, answer, question_id, db)
+    elif message_type == "player_announce" and client_type == "mobile":
+        # Mobile client announcing presence after connection (backup mechanism)
+        player_data = data or {}
+        await manager.broadcast_to_session(
+            session_code,
+            {
+                "type": "player_joined",
+                "data": {
+                    "player_id": player_data.get("player_id") or player_id,
+                    "player_name": player_data.get("player_name"),
+                    "player_photo": player_data.get("player_photo"),
+                    "timestamp": player_data.get("timestamp")
+                    or datetime.now().isoformat(),
+                },
+            },
+            exclude_client_types=["mobile"],
+            critical=True,
+        )
+        logger.info(
+            f"📢 Processed player_announce for {player_data.get('player_name')}"
+        )
+
+    elif message_type == "request_roster" and client_type == "web":
+        # Web client requesting current player roster (e.g., if they think they're out of sync)
+        logger.info(f"📋 Web client requesting roster for session {session_code}")
+        await manager.broadcast_player_roster_update(session_code)
 
     elif message_type == "buzzer_press" and client_type == "mobile":
         # Player pressing buzzer (for buzzer games)
@@ -229,6 +393,116 @@ async def handle_websocket_message(
     elif message_type == "start_game" and client_type == "web":
         # Web client starting the game
         await handle_game_start(session_code, game_handler, db)
+
+    elif message_type == "countdown_complete" and client_type == "web":
+        # Web client signaling countdown has completed
+        # THIS is the synchronized trigger for question reveal on all devices
+        logger.info(
+            f"⏱️ Countdown complete for session {session_code} - Synchronized question reveal"
+        )
+
+        from datetime import timedelta
+
+        # Calculate synchronized start time - 500ms in the future
+        # This gives all clients time to receive and schedule the display
+        now = datetime.utcnow()
+        start_at = now + timedelta(milliseconds=500)
+        start_at_iso = start_at.isoformat() + "Z"
+
+        logger.info(f"🕐 Question will display at: {start_at_iso} (500ms from now)")
+
+        # First, broadcast sync pulse to prepare clients
+        await manager.broadcast_to_session(
+            session_code,
+            {
+                "type": "countdown_complete",
+                "data": {
+                    "ready_for_question": True,
+                    "session_code": session_code,
+                    "timestamp": datetime.now().isoformat(),
+                    "start_at": start_at_iso,  # When to actually display
+                    **data,  # Include any additional data from the client
+                },
+            },
+            critical=True,
+        )
+
+        # Get the current question with synchronized start time
+        from app.database.dbCRUD import get_current_question_details
+
+        try:
+            game_status = get_current_question_details(db, session_code)
+            # Extract just the question object - don't send the entire game status!
+            if game_status and game_status.get("current_question"):
+                question_data = game_status["current_question"]
+
+                # Add synchronized start_at timestamp to question data
+                question_data["start_at"] = start_at_iso
+
+                logger.info(
+                    f"📤 Broadcasting synchronized question {question_data.get('question_id')} with start_at={start_at_iso}"
+                )
+
+                # Queue the question for late joiners and reconnections
+                manager.queue_question(session_code, question_data)
+
+                question_message = {
+                    "type": "question_started",
+                    "data": question_data,
+                }
+
+                # Broadcast to ALL clients with synchronized timing
+                await manager.broadcast_to_session(
+                    session_code,
+                    question_message,
+                    critical=True,
+                )
+
+                logger.info(
+                    f"✅ Question broadcast complete - all clients will reveal at {start_at_iso}"
+                )
+
+                # CRITICAL FALLBACK: Send question directly to each mobile client
+                # This ensures mobiles receive it even if broadcast fails
+                mobile_players = manager.get_mobile_players(session_code)
+                if mobile_players:
+                    logger.info(
+                        f"📱 Sending question directly to {len(mobile_players)} mobile clients as fallback"
+                    )
+
+                    for mobile_player in mobile_players:
+                        player_id = mobile_player.get("player_id")
+                        player_name = mobile_player.get("player_name")
+
+                        # Find this player's websocket connection(s)
+                        connections = manager.get_player_connections(
+                            session_code, player_id
+                        )
+
+                        for ws_id, conn_info in connections.items():
+                            websocket_obj = conn_info.get("websocket")
+                            if websocket_obj:
+                                try:
+                                    await manager.send_personal_message(
+                                        question_message, websocket_obj
+                                    )
+                                    logger.info(
+                                        f"✅ Sent question directly to {player_name} (ws_id: {ws_id})"
+                                    )
+                                except Exception as e:
+                                    logger.error(
+                                        f"❌ Failed to send question to {player_name}: {e}"
+                                    )
+
+                    logger.info(
+                        f"📋 Question delivery complete: queued + broadcast + {len(mobile_players)} individual sends"
+                    )
+                else:
+                    logger.warning(f"⚠️ No mobile players found for question delivery!")
+            else:
+                logger.warning(f"No current question found after countdown_complete")
+        except Exception as e:
+            logger.warning(f"Could not broadcast question after countdown: {e}")
 
     elif message_type == "next_question" and client_type == "web":
         # Web client moving to next question
@@ -320,6 +594,42 @@ async def handle_broadcast_current_question(session_code: str, db: Session):
 async def handle_game_start(session_code: str, game_handler, db: Session):
     """Handle game start event"""
     try:
+        logger.info(f"🎮 Starting game for session {session_code}")
+
+        # CRITICAL: Ensure roster is synced before starting game
+        # Step 1: Wait for all WebSocket connections to be ready
+        await manager.wait_for_ready_connections(session_code, timeout=2.0)
+
+        # Step 2: Verify roster synchronization between WebSocket and database
+        from app.database.dbCRUD import get_number_of_players_in_session
+
+        # Get connected mobile players from WebSocket
+        mobile_connections = manager.get_mobile_players(session_code)
+        ws_player_count = len(mobile_connections)
+
+        # Get registered players from database
+        db_player_count = get_number_of_players_in_session(db, session_code)
+
+        logger.info(
+            f"📊 Roster validation - WebSocket: {ws_player_count} players, Database: {db_player_count} players"
+        )
+
+        # If counts don't match, broadcast roster update and wait briefly
+        if ws_player_count != db_player_count:
+            logger.warning(
+                f"⚠️ Roster mismatch detected! Broadcasting roster update to sync..."
+            )
+            await manager.broadcast_player_roster_update(session_code)
+
+            # Give frontend time to update (small delay)
+            await asyncio.sleep(0.5)
+
+            # Re-check after roster update
+            db_player_count = get_number_of_players_in_session(db, session_code)
+            logger.info(
+                f"📊 After roster sync - WebSocket: {ws_player_count}, Database: {db_player_count}"
+            )
+
         # Update game state in database to mark as started
         from app.logic.game_logic import updateGameStartStatus, get_game_session_state
 
@@ -329,56 +639,102 @@ async def handle_game_start(session_code: str, game_handler, db: Session):
         game_state = get_game_session_state(db, session_code)
         current_question = None
 
+        # Get first question data to include in game_started event
+        first_question_data = None
         if game_state and game_state.current_question_id:
-            # Use the new broadcast system with randomized options
-            if hasattr(game_handler, "broadcast_question_with_options"):
-                await game_handler.broadcast_question_with_options(
-                    game_state.current_question_id, db
-                )
-            else:
-                # Fallback to old system
-                current_question = get_current_question_details(db, session_code)
-                if current_question and hasattr(game_handler, "start_question"):
-                    await game_handler.start_question(current_question)
-                elif current_question:
-                    await game_handler.broadcast_question(current_question)
-
-        # Always get current question for the game_started message
-        if not current_question:
             try:
-                current_question = get_current_question_details(db, session_code)
-            except Exception as e:
-                logger.warning(
-                    f"Could not get current question for game start broadcast: {e}"
+                from app.logic.game_logic import get_question_with_randomized_options
+
+                question_full = get_question_with_randomized_options(
+                    db, game_state.current_question_id
                 )
 
-        # Broadcast game started to all clients - this is crucial for frontend to know game started
-        logger.info(f"🎮 Broadcasting game_started message for session {session_code}")
+                # Determine ui_mode
+                difficulty = question_full.get("difficulty", "").lower()
+                ui_mode = "text_input"
+                if (
+                    question_full.get("display_options")
+                    and len(question_full["display_options"]) > 0
+                ):
+                    if difficulty in ["easy", "medium"]:
+                        ui_mode = "multiple_choice"
+                    elif difficulty == "hard":
+                        ui_mode = "text_input"
+
+                first_question_data = {
+                    "game_type": "trivia",  # CRITICAL: Mobile needs this field!
+                    "question_id": question_full["question_id"],
+                    "question": question_full["question"],
+                    "genre": question_full["genre"],
+                    "difficulty": question_full["difficulty"],
+                    "display_options": question_full["display_options"],
+                    "options": question_full["display_options"],
+                    "ui_mode": ui_mode,
+                }
+                logger.info(
+                    f"📝 Including first question in game_started: {question_full['question_id']}, ui_mode={ui_mode}, game_type=trivia"
+                )
+            except Exception as e:
+                logger.error(f"Error getting first question for game_started: {e}")
+
+        # Step 1: Broadcast game_started event WITHOUT question data
+        # This prevents mobiles from rendering early before intro completes
+        logger.info(f"📡 Broadcasting game_started message for session {session_code}")
+
+        game_started_data = {
+            "session_code": session_code,
+            "started_at": datetime.now().isoformat(),
+            "isstarted": True,
+            "game_state": {
+                "isstarted": True,
+                "is_active": game_state.is_active if game_state else True,
+                "current_question_index": (
+                    game_state.current_question_index if game_state else 0
+                ),
+                "total_questions": (game_state.total_questions if game_state else 1),
+            },
+        }
+
+        # DO NOT include question in game_started - prevents early mobile rendering
+        # The question will be sent after countdown_complete for synchronized display
+
         await manager.broadcast_to_session(
             session_code,
             {
                 "type": "game_started",
-                "data": {
-                    "session_code": session_code,
-                    "started_at": "now",  # You can use proper datetime
-                    "isstarted": True,  # Always True when game starts
-                    "current_question": current_question,
-                    "game_state": {
-                        "isstarted": True,
-                        "is_active": game_state.is_active if game_state else True,
-                        "current_question_index": (
-                            game_state.current_question_index if game_state else 0
-                        ),
-                        "total_questions": (
-                            game_state.total_questions if game_state else 1
-                        ),
-                    },
-                },
+                "data": game_started_data,
             },
+            critical=True,
         )
 
-        # Also broadcast a separate game status update for any clients that might be listening specifically for status
-        logger.info(f"📊 Broadcasting game_status_update for session {session_code}")
+        # Step 2: Send web-only preload so host can prepare UI during intro
+        # This is NOT visible to mobiles - prevents the race condition
+        if first_question_data:
+            logger.info(
+                f"📺 Sending preload_question to WEB only (not visible to mobile yet)"
+            )
+            await manager.broadcast_to_session(
+                session_code,
+                {
+                    "type": "preload_question",
+                    "data": first_question_data,
+                },
+                only_client_types=["web"],
+                critical=True,
+            )
+            logger.info(f"✅ Web host can now prepare question UI during intro")
+        else:
+            logger.warning("⚠️ No question data available for preload!")
+
+        # Step 3: DO NOT broadcast question_started here!
+        # The synchronized question reveal happens ONLY after countdown_complete
+        # This ensures perfect timing between intro finish and question display
+        logger.info(
+            "⏸️ Question broadcast deferred until countdown_complete for synchronized reveal"
+        )
+
+        # Step 4: Send a status update after game_started
+        await asyncio.sleep(0.2)
 
         # Get player counts for accurate status
         from app.database.dbCRUD import (
@@ -404,7 +760,7 @@ async def handle_game_start(session_code: str, game_handler, db: Session):
                 game_state.is_waiting_for_players if game_state else True
             ),
             # Frontend-compatible format
-            "gameState": "active",
+            "game_state": "active",
             "currentQuestion": (
                 (game_state.current_question_index + 1) if game_state else 1
             ),
@@ -413,16 +769,20 @@ async def handle_game_start(session_code: str, game_handler, db: Session):
             "playersAnswered": current_responses,
         }
 
+        logger.info(f"Broadcasting game_status_update for session {session_code}")
         await manager.broadcast_to_session(
             session_code,
             {
                 "type": "game_status_update",
                 "data": status_data,
             },
+            critical=True,
         )
 
+        logger.info(f"Game start sequence complete for session {session_code}")
+
     except Exception as e:
-        logger.error(f"Error starting game: {e}")
+        logger.error(f"Error starting game: {e}", exc_info=True)
 
 
 async def handle_next_question(session_code: str, game_handler, db: Session):
@@ -469,12 +829,26 @@ async def handle_next_question(session_code: str, game_handler, db: Session):
 async def handle_game_end(session_code: str, db: Session):
     """Handle game end event"""
     try:
-        # Update game state in database
-        # You'll need to implement this in dbCRUD
-        # update_game_session_ended(db, session_code)
+        from app.database.dbCRUD import (
+            update_game_session_ended,
+            get_final_scores,
+        )
 
-        # Get final scores (you'll need to implement this)
-        # final_scores = get_final_scores(db, session_code)
+        # Update game state in database and calculate final results
+        success = update_game_session_ended(db, session_code)
+        if not success:
+            logger.error(f"Failed to end game session {session_code}")
+            return
+
+        # Get final scores ranked by score
+        final_scores = get_final_scores(db, session_code)
+
+        # Get current time for ended_at
+        ended_at = datetime.now().isoformat()
+
+        logger.info(
+            f"🏁 Game ended for session {session_code} with {len(final_scores)} players"
+        )
 
         # Broadcast game ended to all clients
         await manager.broadcast_to_session(
@@ -483,17 +857,75 @@ async def handle_game_end(session_code: str, db: Session):
                 "type": "game_ended",
                 "data": {
                     "session_code": session_code,
-                    "ended_at": "now",  # You can use proper datetime
-                    # "final_scores": final_scores
+                    "ended_at": ended_at,
+                    "final_scores": final_scores,
                 },
             },
+            critical=True,
         )
 
+        logger.info(f"✅ Game end broadcast complete for session {session_code}")
+
     except Exception as e:
-        logger.error(f"Error ending game: {e}")
+        logger.error(f"Error ending game: {e}", exc_info=True)
 
 
 # REST endpoints for WebSocket management
+@router.get("/ws/health")
+async def websocket_health_check():
+    """
+    Health check endpoint for WebSocket infrastructure.
+    Monitor this endpoint to detect API issues early.
+    """
+    import psutil
+    import os
+
+    # Get system memory info
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / 1024 / 1024
+
+    # Get WebSocket stats
+    total_connections = manager.get_total_connection_count()
+    active_sessions = manager.get_active_session_count()
+
+    # Calculate per-session average
+    avg_connections_per_session = (
+        total_connections / active_sessions if active_sessions > 0 else 0
+    )
+
+    # Determine health status
+    status = "healthy"
+    warnings = []
+
+    # Check for warning conditions
+    if total_connections > 100:
+        warnings.append(f"High connection count: {total_connections} (threshold: 100)")
+        status = "warning"
+
+    if memory_mb > 500:
+        warnings.append(f"High memory usage: {memory_mb:.1f}MB (threshold: 500MB)")
+        status = "warning"
+
+    if avg_connections_per_session > 10:
+        warnings.append(
+            f"High connections per session: {avg_connections_per_session:.1f} (possible duplicate bug)"
+        )
+        status = "critical"
+
+    return {
+        "status": status,
+        "timestamp": datetime.now().isoformat(),
+        "metrics": {
+            "total_connections": total_connections,
+            "active_sessions": active_sessions,
+            "avg_connections_per_session": round(avg_connections_per_session, 2),
+            "memory_usage_mb": round(memory_mb, 2),
+        },
+        "warnings": warnings,
+    }
+
+
 @router.get("/ws/sessions/{session_code}/stats")
 async def get_session_websocket_stats(session_code: str):
     """Get WebSocket connection statistics for a session"""

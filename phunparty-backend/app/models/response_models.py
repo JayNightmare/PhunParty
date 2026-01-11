@@ -2,7 +2,7 @@ from typing import Optional, List
 
 from pydantic import BaseModel
 
-from app.models.enums import DifficultyLevel, ResultType
+from app.models.enums import DifficultyLevel, ResultType, HistoryResultType
 
 
 class GameResponse(BaseModel):
@@ -26,8 +26,10 @@ class AnswerVerificationResponseModel(BaseModel):
 
 
 class ScoresResponseModel(BaseModel):
+    player_id: str
     score: int
     result: Optional[ResultType] = None
+    session_code: str
 
 
 class QuestionRequest(BaseModel):
@@ -67,3 +69,12 @@ class GameStatusResponse(BaseModel):
     players: dict
     started_at: Optional[str] = None
     ended_at: Optional[str] = None
+
+
+class GameHistoryResponse(BaseModel):
+    session_code: str
+    game_type: str
+    did_win: HistoryResultType
+
+    class Config:
+        from_attributes = True

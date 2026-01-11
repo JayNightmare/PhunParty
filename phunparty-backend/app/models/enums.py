@@ -11,3 +11,9 @@ class ResultType(str, enum.Enum):
     win = "win"
     lose = "lose"
     draw = "draw"
+
+
+class HistoryResultType(str, enum.Enum):
+    win = "Won"
+    lose = "Lost"
+    draw = "Draw"

@@ -1,8 +1,11 @@
 from datetime import datetime, timezone
+import logging
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session, aliased
 from sqlalchemy.orm.attributes import flag_modified
+
+logger = logging.getLogger(__name__)
 
 from app.models.game_model import Game
 from app.models.game_session_model import GameSession
@@ -43,8 +46,19 @@ def create_game_session(
     game_code: str,
     owner_player_id: str = None,
     ispublic: bool = True,
+    difficulty: str = None,
 ) -> GameSession:
-    """Create a new game session with the specified parameters."""
+    """Create a new game session with the specified parameters.
+
+    Args:
+        db: Database session
+        host_name: Name of the host
+        number_of_questions: Number of questions in the session
+        game_code: The game code to link to
+        owner_player_id: Optional player ID of the session owner
+        ispublic: Whether the session is public or private
+        difficulty: Optional difficulty level ('easy', 'medium', 'hard')
+    """
     session_code = generate_session_code()
     gameSession = GameSession(
         session_code=session_code,
@@ -58,7 +72,7 @@ def create_game_session(
     db.refresh(gameSession)
     if not gameSession:
         raise ValueError("Failed to create game session")
-    add_question_to_session(db, session_code)
+    add_question_to_session(db, session_code, difficulty)
 
     # Initialize game state tracking
     try:
@@ -141,54 +155,66 @@ def end_game_session(db: Session, session_code: str) -> dict:
     if not gameSession:
         raise ValueError("Game session not found")
 
-    # Reset active game code for players
-    players = db.query(Players).filter(Players.active_game_code == session_code).all()
-    session_assignments = (
-        db.query(SessionAssignment)
-        .filter(SessionAssignment.session_code == session_code)
-        .all()
-    )
-
-    # Update session assignment end times
-    for assignment in session_assignments:
-        if not assignment.session_end:
-            assignment.session_end = datetime.now()
-
-    # Reset player game codes
-    for player in players:
-        player.active_game_code = None
-
-    # Update game state if it exists
-    game_state = get_game_session_state(db, session_code)
-    if game_state:
-        game_state.is_active = False
-        game_state.is_waiting_for_players = False
-        game_state.ended_at = datetime.utcnow()
-
-    db.commit()
-
-    # Calculate and return final results
     try:
-        final_results = calculate_game_results(db, session_code)
-        return {
-            "action": "game_ended",
-            "game_state": "completed",
-            "final_results": [
-                {
-                    "player_id": result.player_id,
-                    "score": result.score,
-                    "result": result.result,
-                    "player_name": get_player_by_ID(db, result.player_id).player_name,
-                    "session_code": session_code,
-                }
-                for result in final_results
-            ],
-        }
+        # Reset active game code for players
+        players = (
+            db.query(Players).filter(Players.active_game_code == session_code).all()
+        )
+        session_assignments = (
+            db.query(SessionAssignment)
+            .filter(SessionAssignment.session_code == session_code)
+            .all()
+        )
+
+        # Update session assignment end times
+        for assignment in session_assignments:
+            if not assignment.session_end:
+                assignment.session_end = datetime.now()
+
+        # Reset player game codes
+        for player in players:
+            player.active_game_code = None
+
+        # Update game state if it exists
+        game_state = get_game_session_state(db, session_code)
+        if game_state:
+            game_state.is_active = False
+            game_state.is_waiting_for_players = False
+            game_state.ended_at = datetime.utcnow()
+
+        # Calculate and return final results
+        try:
+            final_results = calculate_game_results(db, session_code)
+            return {
+                "action": "game_ended",
+                "game_state": "completed",
+                "final_results": [
+                    {
+                        "player_id": result.player_id,
+                        "score": result.score,
+                        "result": result.result,
+                        "player_name": get_player_by_ID(
+                            db, result.player_id
+                        ).player_name,
+                        "session_code": session_code,
+                    }
+                    for result in final_results
+                ],
+            }
+        except Exception as e:
+            return {
+                "action": "game_ended",
+                "game_state": "completed",
+                "error": f"Could not calculate final results: {str(e)}",
+            }
+
+        finally:
+            db.commit()
     except Exception as e:
+        db.rollback()
         return {
-            "action": "game_ended",
-            "game_state": "completed",
-            "error": f"Could not calculate final results: {str(e)}",
+            "action": "game_end_failed",
+            "error": f"Could not end game session: {str(e)}",
         }
 
 
@@ -326,22 +352,54 @@ def assign_player_to_session(db: Session, player_id: str, session_code: str) -> 
 
 
 # Rebooting
-def add_question_to_session(db: Session, session_code: str) -> None:
-    """Add a question to a game session."""
+def add_question_to_session(
+    db: Session, session_code: str, difficulty: str = None
+) -> None:
+    """Add randomly selected questions to a game session.
+
+    Args:
+        db: Database session
+        session_code: The session code to add questions to
+        difficulty: Optional difficulty level ('easy', 'medium', 'hard'). If None, questions of any difficulty will be selected.
+    """
     session = _get_session_by_code_internal(db, session_code)
     if not session:
         raise ValueError("Session not found")
     game = get_game_by_code(db, session.game_code)
     if not game:
         raise ValueError("Game not found")
-    questions = (
-        db.query(Questions)
-        .filter(Questions.genre == game.genre)
-        .limit(session.number_of_questions)
-        .all()
-    )
+
+    # Build query with genre filter
+    query = db.query(Questions).filter(Questions.genre == game.genre)
+
+    # Add difficulty filter if specified
+    if difficulty:
+        from app.models.enums import DifficultyLevel
+
+        try:
+            difficulty_enum = DifficultyLevel(difficulty.lower())
+            query = query.filter(Questions.difficulty == difficulty_enum)
+        except ValueError:
+            raise ValueError(
+                f"Invalid difficulty level: {difficulty}. Must be 'easy', 'medium', or 'hard'"
+            )
+
+    # Get randomly selected questions
+    questions = query.order_by(func.random()).limit(session.number_of_questions).all()
+
     if not questions:
-        raise ValueError("No questions available for this game genre")
+        difficulty_msg = f" with difficulty '{difficulty}'" if difficulty else ""
+        raise ValueError(
+            f"No questions available for genre '{game.genre}'{difficulty_msg}"
+        )
+
+    if len(questions) < session.number_of_questions:
+        difficulty_msg = f" with difficulty '{difficulty}'" if difficulty else ""
+        raise ValueError(
+            f"Not enough questions available. Found {len(questions)} but need {session.number_of_questions} "
+            f"for genre '{game.genre}'{difficulty_msg}"
+        )
+
     for question in questions:
         assignment = SessionQuestionAssignment(
             assignment_id=generate_question_id(),
@@ -697,39 +755,50 @@ def get_all_sessions_from_player(db: Session, player_id: str) -> list:
 
 def get_game_history_for_player(db: Session, player_id: str) -> list:
     """
-    Get the games played by a specific player using the session assignments table and joining scores table to display if they won, lost, or drew along with their scores.
+    Get the games played by a specific player by checking SessionAssignment table
+    and joining scores table to display if they won, lost, or drew.
+    Returns a list of dictionaries with session_code, game_type (genre), and did_win (boolean).
     """
     history = (
         db.query(
-            GameSession.session_code,
+            SessionAssignment.session_code,
             Game.genre,
-            Scores.score,
             Scores.result,
-            GameSessionState.ended_at,
+        )
+        .distinct()
+        .join(
+            GameSession,
+            SessionAssignment.session_code == GameSession.session_code,
         )
         .join(
-            SessionAssignment,
-            GameSession.session_code == SessionAssignment.session_code,
+            Game,
+            GameSession.game_code == Game.game_code,
         )
         .join(
             Scores,
-            (Scores.session_code == GameSession.session_code)
+            (Scores.session_code == SessionAssignment.session_code)
             & (Scores.player_id == player_id),
         )
-        .join(
-            GameSessionState, GameSession.session_code == GameSessionState.session_code
+        .outerjoin(
+            GameSessionState,
+            SessionAssignment.session_code == GameSessionState.session_code,
         )
         .filter(SessionAssignment.player_id == player_id)
-        .filter(GameSessionState.is_active == False)  # Only completed games
+        .filter(
+            (GameSessionState.is_active == False)
+            | (GameSessionState.session_code == None)
+        )
         .all()
     )
     return [
         {
             "session_code": record.session_code,
-            "genre": record.genre,
-            "score": record.score,
-            "result": record.result,
-            "ended_at": record.ended_at,
+            "game_type": record.genre,
+            "did_win": (
+                "Won"
+                if record.result == "win"
+                else ("Lost" if record.result == "lose" else "Draw")
+            ),
         }
         for record in history
     ]
@@ -877,14 +946,42 @@ def update_game_state_waiting_status(
 
 
 def get_current_question_details(db: Session, session_code: str) -> dict:
-    """Get current question details for a session"""
+    """Get current question details for a session with full question data including options and ui_mode"""
     game_state = get_game_session_state(db, session_code)
     if not game_state:
         return {"error": "Game session not found"}
 
     current_question = None
+    question_details = None
+
     if game_state.current_question_id:
         current_question = get_question_by_id(game_state.current_question_id, db)
+
+        # Get full question details with randomized options using the same logic as broadcast_question_with_options
+        if current_question:
+            from app.logic.game_logic import get_question_with_randomized_options
+
+            try:
+                question_details = get_question_with_randomized_options(
+                    db, game_state.current_question_id
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Could not get randomized options for question {game_state.current_question_id}: {e}"
+                )
+                # Fallback to basic question info
+                question_details = {
+                    "question_id": current_question.question_id,
+                    "question": current_question.question,
+                    "genre": current_question.genre,
+                    "difficulty": (
+                        current_question.difficulty.value
+                        if current_question.difficulty
+                        else "easy"
+                    ),
+                    "display_options": [],
+                    "answer": current_question.answer,
+                }
 
     # Get player counts
     total_players = get_number_of_players_in_session(db, session_code)
@@ -895,6 +992,42 @@ def get_current_question_details(db: Session, session_code: str) -> dict:
             db, session_code, game_state.current_question_id
         )
 
+    # Determine ui_mode based on difficulty and available options
+    ui_mode = "text_input"  # Default fallback
+    if question_details and question_details.get("display_options"):
+        difficulty = question_details.get("difficulty", "").lower()
+        if difficulty in ["easy", "medium"]:
+            ui_mode = "multiple_choice"
+        elif difficulty == "hard":
+            ui_mode = "text_input"
+
+    # Build the current_question response with all necessary fields
+    current_question_data = None
+    if question_details:
+        current_question_data = {
+            "game_type": "trivia",  # CRITICAL: Mobile needs this field to recognize questions!
+            "question_id": question_details.get("question_id"),
+            "question": question_details.get("question"),
+            "genre": question_details.get("genre"),
+            "difficulty": question_details.get("difficulty"),
+            "display_options": question_details.get("display_options", []),
+            "options": question_details.get(
+                "display_options", []
+            ),  # Alias for compatibility
+            "answer": question_details.get("answer"),
+            "correct_index": question_details.get("correct_index"),
+            "ui_mode": ui_mode,
+        }
+    elif current_question:
+        # Minimal fallback if question_details failed
+        current_question_data = {
+            "game_type": "trivia",  # CRITICAL: Mobile needs this field!
+            "question_id": current_question.question_id,
+            "question": current_question.question,
+            "genre": current_question.genre,
+            "ui_mode": "text_input",
+        }
+
     return {
         "session_code": session_code,
         "is_active": game_state.is_active,
@@ -902,16 +1035,18 @@ def get_current_question_details(db: Session, session_code: str) -> dict:
         "isstarted": game_state.isstarted,
         "current_question_index": game_state.current_question_index,
         "total_questions": game_state.total_questions,
-        "current_question": {
-            "question_id": current_question.question_id if current_question else None,
-            "question": current_question.question if current_question else None,
-            "genre": current_question.genre if current_question else None,
-        },
+        "current_question": current_question_data,
         "players": {
             "total": total_players,
             "answered": players_answered,
             "waiting_for": total_players - players_answered,
         },
+        "player_response_counts": {
+            "total": total_players,
+            "answered": players_answered,
+            "waiting": total_players - players_answered,
+        },
+        "game_state": "active" if game_state.isstarted else "waiting",
         "started_at": (
             game_state.started_at.isoformat() if game_state.started_at else None
         ),
@@ -978,3 +1113,97 @@ def update_password(db: Session, phone: str, new_password: str) -> bool:
         db.commit()
         return True
     return False
+
+
+def update_game_session_ended(db: Session, session_code: str) -> bool:
+    """
+    Mark a game session as ended by setting ended_at timestamp and is_active to False.
+    Also calculates final game results (win/lose/draw) for all players.
+
+    Args:
+        db: Database session
+        session_code: The session code to end
+
+    Returns:
+        bool: True if successfully ended, False otherwise
+    """
+    try:
+        # Get the game session state
+        game_state = get_game_session_state(db, session_code)
+        if not game_state:
+            logger.warning(f"Game session state not found for {session_code}")
+            return False
+
+        # Update game state to mark as ended
+        game_state.is_active = False
+        game_state.ended_at = datetime.utcnow()
+
+        # Calculate game results (win/lose/draw) for all players
+        try:
+            calculate_game_results(db, session_code)
+        except ValueError as e:
+            logger.warning(f"Could not calculate game results for {session_code}: {e}")
+
+        db.commit()
+        db.refresh(game_state)
+
+        logger.info(f"Game session {session_code} ended at {game_state.ended_at}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error ending game session {session_code}: {e}")
+        db.rollback()
+        return False
+
+
+def get_final_scores(db: Session, session_code: str) -> list[dict]:
+    """
+    Get final scores for a game session, ranked by score (highest first).
+    Includes player details and their results (win/lose/draw).
+
+    Args:
+        db: Database session
+        session_code: The session code to get scores for
+
+    Returns:
+        list[dict]: List of score dictionaries with player info, sorted by score descending
+    """
+    try:
+        # Join Scores with Players to get player details
+        scores_query = (
+            db.query(Scores, Players)
+            .join(Players, Scores.player_id == Players.player_id)
+            .filter(Scores.session_code == session_code)
+            .order_by(Scores.score.desc())
+            .all()
+        )
+
+        if not scores_query:
+            logger.warning(f"No scores found for session {session_code}")
+            return []
+
+        # Format the results
+        final_scores = []
+        for score, player in scores_query:
+            final_scores.append(
+                {
+                    "player_id": player.player_id,
+                    "player_name": player.player_name,
+                    "player_photo": getattr(player, "player_photo", None),
+                    "score": score.score,
+                    "result": (
+                        score.result.value if score.result else None
+                    ),  # win/lose/draw
+                    "rank": len([s for s, _ in scores_query if s.score > score.score])
+                    + 1,
+                }
+            )
+
+        logger.info(
+            f"Retrieved {len(final_scores)} final scores for session {session_code}"
+        )
+        return final_scores
+
+    except Exception as e:
+        logger.error(f"Error getting final scores for {session_code}: {e}")
+        return []

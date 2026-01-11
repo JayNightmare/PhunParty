@@ -41,24 +41,37 @@ class GameEventHandler:
 
     async def broadcast_question(self, question_data: Dict[str, Any]):
         """Broadcast question to all clients with different formats"""
-        # Send full question to web clients
-        await manager.broadcast_to_web_clients(
+        # Reset all players' answered status for the new question
+        manager.reset_all_players_answered(self.session_code)
+
+        logger.info(f"Broadcasting question to session {self.session_code}")
+
+        # Send full question to web clients with critical flag
+        await manager.broadcast_to_session(
             self.session_code,
             {
                 "type": "question_started",
                 "data": {"question": question_data, "game_type": self.game_type},
             },
+            only_client_types=["web"],
+            critical=True,
         )
 
-        # Send appropriate mobile UI data to mobile clients
+        # Send appropriate mobile UI data to mobile clients with critical flag
         mobile_data = self.format_question_for_mobile(question_data)
-        await manager.broadcast_to_mobile_players(
-            self.session_code, {"type": "question_started", "data": mobile_data}
+        await manager.broadcast_to_session(
+            self.session_code,
+            {"type": "question_started", "data": mobile_data},
+            only_client_types=["mobile"],
+            critical=True,
         )
 
     async def broadcast_question_with_options(self, question_id: str, db):
         """Broadcast question with randomized options using the new system"""
         try:
+            # Reset all players' answered status for the new question
+            manager.reset_all_players_answered(self.session_code)
+
             from app.logic.game_logic import broadcast_question_with_options
 
             await broadcast_question_with_options(self.session_code, question_id, db)
@@ -113,6 +126,9 @@ class TriviaGameHandler(GameEventHandler):
             # Log the result for debugging
             logger.info(f"Answer submission result for player {player_id}: {result}")
 
+            # Mark player as having answered in WebSocket connection info
+            manager.set_player_answered(self.session_code, player_id, True)
+
             # Get player info for broadcasting
             player = get_player_by_ID(db, player_id)
             player_name = player.player_name if player else "Unknown Player"
@@ -130,10 +146,16 @@ class TriviaGameHandler(GameEventHandler):
                         "game_state": result.get("game_state", {}),
                     },
                 },
+                critical=True,
             )
 
             # Also broadcast game status update to ensure frontend stays in sync
             game_status_data = result.get("game_state", {})
+
+            # Add real-time WebSocket-based answered count
+            ws_answered_count = manager.get_answered_count(self.session_code)
+            game_status_data["playersAnswered"] = ws_answered_count
+
             logger.info(f"Broadcasting game_status_update: {game_status_data}")
             await manager.broadcast_to_session(
                 self.session_code,
@@ -141,6 +163,7 @@ class TriviaGameHandler(GameEventHandler):
                     "type": "game_status_update",
                     "data": game_status_data,
                 },
+                critical=True,
             )
 
             # If game advanced to next question, broadcast it
@@ -151,7 +174,7 @@ class TriviaGameHandler(GameEventHandler):
 
             if action == "next_question":
                 logger.info(
-                    f"🚀 Advancing to next question for session {self.session_code}"
+                    f"Advancing to next question for session {self.session_code}"
                 )
                 # Get the new question details and broadcast with options
                 from app.logic.game_logic import get_game_session_state
@@ -159,14 +182,14 @@ class TriviaGameHandler(GameEventHandler):
                 game_state = get_game_session_state(db, self.session_code)
                 if game_state and game_state.current_question_id:
                     logger.info(
-                        f"📝 Broadcasting new question {game_state.current_question_id} with options"
+                        f"Broadcasting new question {game_state.current_question_id} with options"
                     )
                     await self.broadcast_question_with_options(
                         game_state.current_question_id, db
                     )
                 else:
                     logger.warning(
-                        "⚠️ No current question ID found, using fallback method"
+                        "No current question ID found, using fallback method"
                     )
                     # Fallback to old method if no current question ID
                     from app.database.dbCRUD import get_current_question_details
@@ -178,7 +201,7 @@ class TriviaGameHandler(GameEventHandler):
                         logger.info(f"📝 Broadcasting question via fallback method")
                         await self.broadcast_question(current_question)
                     else:
-                        logger.error("❌ No current question found via fallback method")
+                        logger.error("No current question found via fallback method")
 
             # If game ended, broadcast game end
             elif action == "game_ended":
@@ -192,7 +215,7 @@ class TriviaGameHandler(GameEventHandler):
                 )
             elif action is None:
                 logger.info(
-                    f"⏳ No action needed - waiting for more players or other conditions"
+                    f" No action needed - waiting for more players or other conditions"
                 )
 
             # Send confirmation to the specific mobile player
@@ -222,15 +245,40 @@ class TriviaGameHandler(GameEventHandler):
     def format_question_for_mobile(
         self, question_data: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Format trivia question for mobile - show question and options"""
+        """Format trivia question for mobile - send FULL question data with all fields"""
+        # Determine ui_mode from difficulty if not already set
+        difficulty = str(question_data.get("difficulty", "easy")).lower()
+        ui_mode = question_data.get("ui_mode")
+
+        if not ui_mode:
+            # Calculate ui_mode based on difficulty and options
+            has_options = bool(
+                question_data.get("display_options") or question_data.get("options")
+            )
+            if has_options:
+                ui_mode = (
+                    "multiple_choice"
+                    if difficulty in ["easy", "medium"]
+                    else "text_input"
+                )
+            else:
+                ui_mode = "text_input"
+
         return {
             "game_type": "trivia",
+            "question_id": question_data.get("question_id"),
             "question": question_data.get("question", ""),
-            "options": question_data.get(
+            "genre": question_data.get("genre"),
+            "difficulty": question_data.get("difficulty"),
+            "display_options": question_data.get(
                 "display_options", question_data.get("options", [])
             ),
-            "question_id": question_data.get("question_id"),
-            "ui_mode": "multiple_choice",
+            "options": question_data.get(
+                "display_options", question_data.get("options", [])
+            ),  # Alias for compatibility
+            "ui_mode": ui_mode,
+            "correct_index": question_data.get("correct_index"),
+            "answer": question_data.get("answer"),
         }
 
 
